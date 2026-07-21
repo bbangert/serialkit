@@ -83,11 +83,16 @@ class SerialDevice(Generic[S]):
     """
 
     # ---- driver-declared config (class attributes) ----
-    framer_factory: Callable[[], Framer]  # required; fresh framer per connection
+    # A fresh framer per connection. Either a zero-arg callable (a
+    # ``staticmethod`` lambda, or any function — the runtime reads it off the
+    # class, so it is never bound to ``self``) OR a Framer instance used as a
+    # prototype (the runtime deep-copies and resets it per connection).
+    framer_factory: Callable[[], Framer] | Framer
     # A shared mutable class-level Pacing (lock + next-allowed timestamp)
     # across all instances is a trap, so None means "kit creates a
-    # per-instance Pacing()"; a subclass that sets a Pacing gets it copied
-    # per instance (see __init__).
+    # per-instance Pacing()"; a subclass that sets a Pacing gets a private
+    # clone per instance (see __init__). Backoff and ProbeSpec are frozen
+    # dataclasses, so sharing them as class attributes is safe.
     pacing: Pacing | None = None
     probe: ProbeSpec | None = None  # None = no watchdog; explicit opt-in
     backoff: Backoff = Backoff()
@@ -99,7 +104,7 @@ class SerialDevice(Generic[S]):
     ) -> None:
         self._connect = connect
         self.pending = PendingTracker(max_in_flight=self.max_in_flight)
-        self._pacing = self.pacing if self.pacing is not None else Pacing()
+        self._pacing = self.pacing.clone() if self.pacing is not None else Pacing()
         self.state: S | None = None
         self.connected = False
         # Per-frame hardening log: (frame, exc) for every on_frame crash and
@@ -275,8 +280,15 @@ class SerialDevice(Generic[S]):
     # ---- internals ----
 
     def _new_framer(self) -> Framer:
-        factory = type(self).framer_factory
-        return factory()
+        # Read off the class, not the instance, so a plain-function factory is
+        # never bound to self (that is the staticmethod wart).
+        spec = type(self).framer_factory
+        if callable(spec):
+            return spec()
+        # A Framer instance used as a prototype: a fresh, empty copy each time.
+        fresh = copy.deepcopy(spec)
+        fresh.reset()
+        return fresh
 
     async def _open_session(self) -> None:
         reader, writer = await self._connect()
