@@ -34,9 +34,24 @@ class Pacing:
         self._min_interval = min_interval
         self._per_command = dict(per_command or {})
         self._time_func = time_func
+        self._sleep_func = sleep_func
         self._sleep = sleep_func or asyncio.sleep
         self._lock = asyncio.Lock()
         self._next_allowed = float("-inf")
+
+    def clone(self) -> Pacing:
+        """A fresh Pacing with the same config but its own lock and clock.
+
+        Used by :class:`SerialDevice` so a ``Pacing`` declared as a class
+        attribute is never shared (its lock and next-allowed timestamp) across
+        instances or event loops.
+        """
+        return Pacing(
+            self._min_interval,
+            self._per_command,
+            time_func=self._time_func,
+            sleep_func=self._sleep_func,
+        )
 
     def interval_for(self, frame: bytes, *, pace: float | None = None) -> float:
         """Interval to hold after ``frame`` before the next send."""
