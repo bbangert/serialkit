@@ -14,6 +14,7 @@ from serialkit import (
     ConnectionLostError,
     DelimiterFramer,
     Pacing,
+    ProbeSpec,
     match_prefix,
 )
 
@@ -150,3 +151,146 @@ def test_pacing_class_attr_is_not_shared_across_instances() -> None:
     d2 = PacedDevice(FakeLink().connect)
     assert d1._pacing is not d2._pacing         # each instance gets its own
     assert d1._pacing is not PacedDevice.pacing  # not the shared class attr
+
+
+# ---- BLOCKER regression: a request queued across a reconnect --------------
+
+async def test_request_queued_across_reconnect_not_written_to_new_session(
+    link: FakeLink,
+) -> None:
+    """A caller blocked on the max_in_flight slot when the link drops must NOT
+    wake mid-reconnect and write its stale frame onto the NEW session (which
+    would reintroduce cross-session correlation bleed). It abandons the write
+    and fails with ConnectionLostError; its frame never reaches connection 2."""
+
+    class GatedPaced(DictDevice):
+        max_in_flight = 1
+        pacing = Pacing(min_interval=0.05)  # B's write waits behind pacing...
+        # DictDevice's tiny backoff (0.01) lets the reconnect finish first.
+
+    dev = GatedPaced(link.connect)
+    await dev.start()
+    try:
+        # A holds the only slot (never answered).
+        task_a = asyncio.ensure_future(
+            dev.request(b"A\n", match_prefix(b"NEVER"), timeout=5.0))
+        await asyncio.sleep(0.01)
+        # B queues behind the slot gate — not yet on the wire.
+        task_b = asyncio.ensure_future(
+            dev.request(b"B\n", match_prefix(b"NEVER"), timeout=5.0))
+        await asyncio.sleep(0.01)
+        assert link.sent == [b"A\n"]
+
+        link.drop()  # A fails, B's slot frees, reconnect runs during B's pacing
+
+        with pytest.raises(ConnectionLostError):
+            await task_a
+        with pytest.raises(ConnectionLostError):
+            await task_b  # write abandoned across the session change
+
+        await asyncio.sleep(0.1)  # let the reconnect settle
+        assert link.connects == 2
+        # The crux: B's stale frame never landed on the new session.
+        assert b"B\n" not in link.writers[1].written
+        assert link.writers[1].written == []
+        assert link.writers[0].written == [b"A\n"]
+    finally:
+        await dev.stop()
+
+
+async def test_cancel_while_queued_for_slot_does_not_wedge_the_gate(
+    link: FakeLink,
+) -> None:
+    class Gated(DictDevice):
+        max_in_flight = 1
+
+    dev = Gated(link.connect)
+    await dev.start()
+    try:
+        task_a = asyncio.ensure_future(
+            dev.request(b"A\n", match_prefix(b"X"), timeout=5.0))
+        await asyncio.sleep(0.01)
+        task_b = asyncio.ensure_future(
+            dev.request(b"B\n", match_prefix(b"X"), timeout=5.0))
+        await asyncio.sleep(0.01)
+        assert link.sent == [b"A\n"]  # B queued for the slot
+
+        task_b.cancel()  # cancel B while it waits on the semaphore
+        with pytest.raises(asyncio.CancelledError):
+            await task_b
+
+        # A still resolves, and the slot is not wedged: C acquires it after A.
+        link.rx(b"X_A\n")
+        assert await task_a == b"X_A"
+        task_c = asyncio.ensure_future(
+            dev.request(b"C\n", match_prefix(b"X"), timeout=5.0))
+        await asyncio.sleep(0.01)
+        assert b"C\n" in link.sent
+        link.rx(b"X_C\n")
+        assert await task_c == b"X_C"
+    finally:
+        await dev.stop()
+
+
+# ---- W1: writes are drained ----------------------------------------------
+
+async def test_writes_await_drain(link: FakeLink) -> None:
+    dev = DictDevice(link.connect)
+    await dev.start()
+    try:
+        await dev.send(b"PING\n")
+        assert link.writer.drains >= 1  # drain() was awaited after the write
+    finally:
+        await dev.stop()
+
+
+# ---- W2: concurrent batches don't flush each other early ------------------
+
+async def test_concurrent_batches_do_not_flush_early(link: FakeLink) -> None:
+    dev = DictDevice(link.connect)
+    snapshots: list = []
+    dev.subscribe(snapshots.append)
+    await dev.start()
+    try:
+        await asyncio.sleep(0)
+        snapshots.clear()
+
+        async def burst(key: str, hold: float) -> None:
+            with dev.batch():
+                dev.state[key] = 1
+                dev.notify()
+                await asyncio.sleep(hold)
+
+        t1 = asyncio.ensure_future(burst("a", 0.02))
+        t2 = asyncio.ensure_future(burst("b", 0.06))
+        await asyncio.sleep(0.04)  # t1 has exited; t2's batch is still open
+        # Ref-counted batch(): t1's exit must NOT flush while t2 holds a batch.
+        assert snapshots == []
+        await asyncio.gather(t1, t2)
+        await asyncio.sleep(0)
+        assert snapshots == [{"a": 1, "b": 1}]  # one flush after both closed
+    finally:
+        await dev.stop()
+
+
+# ---- probe write failure triggers reconnect ------------------------------
+
+async def test_probe_write_failure_triggers_reconnect(link: FakeLink) -> None:
+    class Probed(DictDevice):
+        probe = ProbeSpec(frame=b"PING\n", idle=0.02, attempts=3)
+
+    def boom(data: bytes) -> None:
+        if data == b"PING\n":
+            raise OSError("simulated write failure")
+
+    link.on_write = boom
+    dev = Probed(link.connect)
+    await dev.start()
+    try:
+        for _ in range(200):
+            if link.connects >= 2:
+                break
+            await asyncio.sleep(0.01)
+        assert link.connects >= 2  # probe write failed -> session loss -> reconnect
+    finally:
+        await dev.stop()

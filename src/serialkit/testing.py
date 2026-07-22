@@ -70,6 +70,7 @@ class FakeWriter:
         self, on_write: Callable[[bytes], None] | None = None
     ) -> None:
         self.written: list[bytes] = []
+        self.drains = 0
         self.closed = False
         self._on_write = on_write
 
@@ -79,6 +80,9 @@ class FakeWriter:
         self.written.append(bytes(data))
         if self._on_write is not None:
             self._on_write(bytes(data))
+
+    async def drain(self) -> None:
+        self.drains += 1
 
     def close(self) -> None:
         self.closed = True
