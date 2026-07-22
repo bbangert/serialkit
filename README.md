@@ -1,5 +1,9 @@
 # serialkit
 
+[![Test](https://github.com/home-assistant-libs/serialkit/actions/workflows/test.yml/badge.svg)](https://github.com/home-assistant-libs/serialkit/actions/workflows/test.yml)
+[![PyPI](https://img.shields.io/pypi/v/serialkit.svg)](https://pypi.org/project/serialkit/)
+[![Python](https://img.shields.io/pypi/pyversions/serialkit.svg)](https://pypi.org/project/serialkit/)
+
 Asyncio robustness toolkit for RS232 device drivers, built on
 [serialx](https://github.com/puddly/serialx).
 
