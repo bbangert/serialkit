@@ -109,7 +109,9 @@ def test_length_prefixed_split_across_chunks() -> None:
     assert framer.feed(b"CD\x01Z") == [b"\x04ABCD", b"\x01Z"]
 
 
-def test_length_prefixed_oversize_desyncs() -> None:
+def test_length_prefixed_oversize_desyncs_and_reset_recovers() -> None:
     framer = LengthPrefixedFramer(1, lambda header: header[0], max_frame=8)
     with pytest.raises(ResyncError):
         framer.feed(b"\xff" + b"pad")  # declared 255 > max_frame 8
+    framer.reset()
+    assert framer.feed(b"\x02AB") == [b"\x02AB"]  # clean after reset

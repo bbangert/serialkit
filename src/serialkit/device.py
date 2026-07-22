@@ -122,7 +122,12 @@ class SerialDevice(Generic[S]):
         self._last_rx = 0.0
         self._notify_dirty = False
         self._notify_scheduled = False
-        self._batching = False
+        self._batch_depth = 0
+        # Bumped on every connection. A request/send captures it before it
+        # awaits a slot/pacing; if it changes underneath (a reconnect happened
+        # while the caller was queued), the write is abandoned so a stale frame
+        # can never land on a new session.
+        self._session_id = 0
 
     # ---- lifecycle callbacks (driver overrides) ----
 
@@ -184,23 +189,32 @@ class SerialDevice(Generic[S]):
         Sugar for a burst of awaited requests (denon-style ``query_state`` of
         ~16 commands) that would otherwise deliver one notification per
         response. ``notify()`` calls inside the block set the dirty flag; the
-        single coalesced snapshot is delivered on exit.
+        single coalesced snapshot is delivered when the last active batch
+        exits. Ref-counted, so nested or concurrent batches (e.g. a manual
+        poll racing a reconnect handshake) don't flush each other's window
+        early — the flush waits until every batch has closed.
         """
-        outer = self._batching
-        self._batching = True
+        self._batch_depth += 1
         try:
             yield
         finally:
-            self._batching = outer
-            if not outer:
+            self._batch_depth -= 1
+            if self._batch_depth == 0:
                 self._flush_notify()
 
     async def send(self, frame: bytes, *, pace: float | None = None) -> None:
         """Paced write (awaits the paced write itself)."""
         if not self.connected:
             raise ConnectionLostError("not connected")
+        session = self._session_id
         async with self._pacing.send_slot(frame, pace=pace):
+            # The connection may have dropped (and possibly reconnected) while
+            # we were queued behind pacing; never write onto a different
+            # session's writer.
+            if not self.connected or self._session_id != session:
+                raise ConnectionLostError("connection changed before write")
             self._writer.write(frame)
+            await self._drain()
 
     async def request(
         self,
@@ -217,6 +231,7 @@ class SerialDevice(Generic[S]):
         """
         if not self.connected:
             raise ConnectionLostError("not connected")
+        session = self._session_id
         future = await self.pending.add(
             matcher,
             timeout=self.request_timeout if timeout is None else timeout,
@@ -226,9 +241,18 @@ class SerialDevice(Generic[S]):
                 # The timeout timer started in add(); if it fired (or the
                 # connection died) while we were queued behind pacing, the
                 # write MUST be abandoned — emitting it would put an untracked
-                # command on the wire (sony desync).
-                if not future.done():
+                # command on the wire (sony desync). Likewise if a reconnect
+                # happened underneath us: this future belongs to the old
+                # session's tracker, so never write it onto the new writer.
+                if future.done():
+                    pass
+                elif not self.connected or self._session_id != session:
+                    future.set_exception(
+                        ConnectionLostError("connection changed before write")
+                    )
+                else:
                     self._writer.write(frame)
+                    await self._drain()
         except asyncio.CancelledError:
             future.cancel()
             raise
@@ -279,6 +303,18 @@ class SerialDevice(Generic[S]):
 
     # ---- internals ----
 
+    async def _drain(self) -> None:
+        """Await the writer's flow control if it exposes ``drain``.
+
+        A duck-typed ``StreamWriter.drain()`` applies backpressure so a burst
+        of writes can't outrun the OS/proxy buffer; on transports without one
+        (test doubles) this is a no-op.
+        """
+        writer = self._writer
+        drain = getattr(writer, "drain", None)
+        if drain is not None:
+            await drain()
+
     def _new_framer(self) -> Framer:
         # Read off the class, not the instance, so a plain-function factory is
         # never bound to self (that is the staticmethod wart).
@@ -293,6 +329,11 @@ class SerialDevice(Generic[S]):
     async def _open_session(self) -> None:
         reader, writer = await self._connect()
         loop = asyncio.get_running_loop()
+        self._session_id += 1
+        # Rebuild pending per connection so a caller still queued on the old
+        # session's slot gate can never have its future resolved by the new
+        # session's frames (state is likewise rebuilt below).
+        self.pending = PendingTracker(max_in_flight=self.max_in_flight)
         self._reader = reader
         self._writer = writer
         self._framer = self._new_framer()
@@ -434,8 +475,8 @@ class SerialDevice(Generic[S]):
 
     def _flush_notify(self) -> None:
         self._notify_scheduled = False
-        if self._batching:
-            return  # keep the dirty flag; flushed when the batch block exits
+        if self._batch_depth:
+            return  # keep the dirty flag; flushed when the last batch exits
         if not self._notify_dirty:
             return
         self._notify_dirty = False
