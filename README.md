@@ -1,8 +1,8 @@
 # serialkit
 
 [![Test](https://github.com/bbangert/serialkit/actions/workflows/test.yml/badge.svg)](https://github.com/bbangert/serialkit/actions/workflows/test.yml)
-[![PyPI](https://img.shields.io/pypi/v/serialkit.svg)](https://pypi.org/project/serialkit/)
-[![Python](https://img.shields.io/pypi/pyversions/serialkit.svg)](https://pypi.org/project/serialkit/)
+[![PyPI](https://img.shields.io/pypi/v/serial-toolkit.svg)](https://pypi.org/project/serial-toolkit/)
+[![Python](https://img.shields.io/pypi/pyversions/serial-toolkit.svg)](https://pypi.org/project/serial-toolkit/)
 
 Asyncio robustness toolkit for RS232 device drivers, built on
 [serialx](https://github.com/puddly/serialx).
@@ -18,13 +18,14 @@ bespoke handling.
 ## Installation
 
 ```bash
-pip install serialkit
+pip install serial-toolkit
 
 # To talk to a device over an ESPHome serial proxy:
-pip install 'serialkit[esphome]'
+pip install 'serial-toolkit[esphome]'
 ```
 
-Requires Python 3.14+.
+The distribution is named `serial-toolkit` on PyPI; the import package is
+`serialkit` (`import serialkit`). Requires Python 3.14+.
 
 ## Concepts
 
