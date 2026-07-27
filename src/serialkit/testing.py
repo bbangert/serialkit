@@ -21,8 +21,8 @@ exercised in the form it actually takes on hardware:
 :meth:`FakeLink.fail_writes`
 ``(silent=True)``              writes accepted and discarded, reproducing the
                                fd transport where a failed ``os.write``
-                               returns normally and the error surfaces one
-                               call later.
+                               returns normally: the frame never goes out and
+                               nothing ever reports it.
 :meth:`FakeLink.fail_writes`   ``write()`` raises immediately.
 :meth:`FakeLink.hang_connect`  a ``connect`` factory that never resolves.
 ============================== ==========================================

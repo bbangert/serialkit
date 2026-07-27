@@ -143,7 +143,7 @@ class WaitRegistry:
         """Advance the RX counter and offer ``frame``.
 
         Returns ``True`` if an exchange claimed it (so it must NOT reach
-        ``on_frame``), ``False`` otherwise. Armed ``expect`` waivers that match
+        ``on_frame``), ``False`` otherwise. Armed ``expect`` waiters that match
         are resolved here but never consume the frame.
         """
         self.rx_count += 1
@@ -289,10 +289,14 @@ class ExchangeContext:
         assert self._exchange is not None
         try:
             unclaimed = self.registry.close_exchange(self._exchange)
+            if unclaimed:
+                # Re-deliver while the wire lock is still held: once it is
+                # released the next exchange can open, and a frame from this
+                # round must never be claimed as that one's answer. Delivery
+                # does not touch the lock, so holding it here is safe.
+                self.release(unclaimed)
         finally:
             self.lock.release()
-        if unclaimed:
-            self.release(unclaimed)
 
 
 __all__ = ["Exchange", "ExchangeContext", "WaitRegistry"]
