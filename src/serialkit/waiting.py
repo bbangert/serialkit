@@ -102,7 +102,11 @@ class WaitRegistry:
         waiter = _Waiter(match, future)
         self._waiters.append(waiter)
         waiter.timer = loop.call_later(timeout, self._expire, waiter, timeout)
-        future.add_done_callback(lambda _: waiter.cancel_timer())
+        # The single cleanup path, so every terminal state drops the waiter:
+        # timeout, a matching frame, an explicit cancel, and — the one the
+        # other paths miss — a caller whose task is cancelled while awaiting.
+        # Idempotent, so the paths that already discarded are unaffected.
+        future.add_done_callback(lambda _: self._discard(waiter))
         return future
 
     def _expire(self, waiter: _Waiter, timeout: float) -> None:

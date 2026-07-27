@@ -9,6 +9,7 @@ answer to the wrong command.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable
 
 import pytest
 from conftest import Recorder
@@ -39,6 +40,12 @@ def make_link(link: FakeLink, handler: object, **kwargs: object) -> SerialLink:
 
 def starts_with(prefix: bytes) -> object:
     return lambda frame: frame.startswith(prefix)
+
+
+async def _await(awaitable: Awaitable[bytes]) -> bytes:
+    """Await in a task, so cancelling the task cancels the underlying future
+    the way a real caller's cancellation does."""
+    return await awaitable
 
 
 # ---- expect: armed at call time -----------------------------------------
@@ -133,6 +140,51 @@ async def test_every_matching_waiter_resolves(
         assert await a == b"POW1"
         assert await b == b"POW1"
         assert handler.frames == [b"POW1"]
+    finally:
+        await dev.stop()
+
+
+async def test_a_cancelled_waiter_is_dropped_from_the_registry(
+    link: FakeLink, handler: Recorder
+) -> None:
+    """Every terminal state must drop the waiter, including a caller whose
+    task is cancelled while awaiting. A connection is meant to hold for
+    months and route() walks the list on every frame, so a waiter that
+    lingers past its future costs dispatch time for the rest of the session.
+    """
+    dev = make_link(link, handler)
+    await dev.start()
+    try:
+        for _ in range(5):
+            waiter = dev.expect(lambda f: False, timeout=30.0)
+            task = asyncio.ensure_future(_await(waiter))
+            await asyncio.sleep(0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            await asyncio.sleep(0)  # let the done-callback run
+
+        assert dev._registry._waiters == []
+
+        # ...and the registry still works.
+        waiter = dev.expect(starts_with(b"POW"), timeout=1.0)  # type: ignore[arg-type]
+        link.rx(b"POW1\n")
+        assert await waiter == b"POW1"
+        assert dev._registry._waiters == []
+    finally:
+        await dev.stop()
+
+
+async def test_a_timed_out_waiter_is_dropped_from_the_registry(
+    link: FakeLink, handler: Recorder
+) -> None:
+    dev = make_link(link, handler)
+    await dev.start()
+    try:
+        with pytest.raises(CommandTimeoutError):
+            await dev.expect(lambda f: False, timeout=0.02)
+        await asyncio.sleep(0)
+        assert dev._registry._waiters == []
     finally:
         await dev.stop()
 
