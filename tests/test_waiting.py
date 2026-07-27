@@ -283,10 +283,14 @@ async def test_confirm_raises_when_every_attempt_times_out(
         await dev.stop()
 
 
-async def test_confirm_cannot_pass_vacuously(link: FakeLink, handler: Recorder) -> None:
-    """A frame that has not arrived yet cannot already be true. Power is
-    already on and stays on; with nothing on the wire, confirm must fail rather
-    than report success into a void — the silently-dead-link case."""
+async def test_confirm_requires_a_frame_after_the_send(
+    link: FakeLink, handler: Recorder
+) -> None:
+    """confirm() resolves on evidence the device sent, not on a state that was
+    already correct. Power is reported on, then the link goes silent: with
+    nothing arriving after the nudge, confirm times out. On a dead link that is
+    the difference between reporting failure and reporting success into a void.
+    """
     dev = make_link(link, handler)
     await dev.start()
     try:

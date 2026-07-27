@@ -82,20 +82,22 @@ tests/
   differ. A publisher going quiet is evidence (`IdleProbe`); a transactional
   device is silent at rest, so only unanswered commands are (`FailureCount`).
 
-## Waiting: three primitives, no correlation
+## Waiting for a frame
 
-RS232 devices are overwhelmingly not request/reply. Commands are
-fire-and-forget and the device reports state on its own schedule, so an
-arriving frame has no guaranteed causal link to anything sent. The kit
-therefore offers observation and exclusivity, never matcher correlation.
+Two shapes, matching how the device talks. `exchange()` is request/reply for a
+device where every frame is caused by something sent; it holds the wire so the
+reply to the outstanding command is unambiguous, and anchors on arrival order
+because that is the discriminator these protocols reliably give you. `expect()`
+is for a device that reports state on its own schedule, where an arriving frame
+often answers nothing in particular.
 
 - `expect(match, timeout)` arms a waiter **at call time**, so it can be armed
   before the send and a same-chunk reply is never lost. It **observes without
   consuming**: a matching frame still reaches `on_frame`, because the frame
   confirming a power-on is also the state report the driver must apply.
 - `confirm(nudge=…, match=…, timeout=…, retries=…)` arms, sends, waits,
-  retries. A frame that has not arrived yet cannot already be true, so this is
-  an honest delivery confirmation rather than a check that passes vacuously.
+  retries. It resolves only on a frame the device actually sent, since one that
+  has not arrived yet cannot already satisfy the predicate.
 - `exchange()` holds the wire exclusively and **claims** the frames it reads,
   for a device whose replies are only decodable against the outstanding
   command.

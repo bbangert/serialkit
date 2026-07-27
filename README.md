@@ -11,8 +11,8 @@ serialkit handles framing a byte stream, pacing writes, the read loop, liveness,
 reconnect, and the anchoring that keeps a late reply from being read as the next
 command's answer — behind an `asyncio.Protocol`-flavoured callback API.
 
-Your driver **owns** a `SerialLink` and implements `DeviceHandler`. The kit
-stays out of your namespace, and your library names its own public API.
+Your driver owns a `SerialLink` and implements `DeviceHandler`, so your library
+keeps its own public API.
 
 ## Installation
 
@@ -31,28 +31,27 @@ The distribution is named `serial-toolkit` on PyPI; the import package is
 serialkit owns the wire: framing, pacing, exclusivity, sequence anchoring,
 dispatch, reconnect, and liveness.
 
-It has **no knowledge of any device** — no commands, no responses, no state.
-`SerialLink` is not generic; your device model stays in your library as an
-ordinary attribute, with no kit contract attached to it.
+It knows nothing about any device: no commands, no responses, no state. Your
+device model lives in your library as an ordinary attribute, with no kit
+contract attached to it.
 
 ## Concepts
 
 - **One dispatch task per connection.** It reads the transport, frames each
   chunk, and calls your sync `on_frame` once per frame in order. A crash in
-  `on_frame` is recorded in `frame_errors` and swallowed — it never kills the
-  loop or the next frame.
-- **`on_turn()` is the coalescing point.** It fires once after all the frames
-  from one read chunk have been dispatched. This is the one thing you cannot
-  compute for yourself, because only the kit knows where a chunk's frames stop.
-  Flush your queued events to subscribers here.
-- **`on_connect()` runs on *every* connection**, with frames already flowing —
-  so `send`, `sweep`, `expect` and `exchange` all work inside it. Run your full
-  re-query here. Stale data after a reconnect is a protocol problem: ask the
-  device again and fresh events overwrite whatever you held.
-- **No correlation, because these devices aren't request/reply.** A command is
-  fire-and-forget and the device reports state on its own schedule, so an
-  arriving frame has no guaranteed causal link to anything you sent. You get
-  observation and exclusivity instead (see below).
+  `on_frame` is recorded in `frame_errors`; the loop and the rest of the chunk
+  carry on.
+- **`on_turn()` marks the end of a read chunk**, once every frame in it has
+  reached `on_frame`. Flush your queued events here and a burst of frames
+  becomes a single notification.
+- **`on_connect()` runs with frames already flowing**, so `send`, `sweep`,
+  `expect` and `exchange` all work inside it. Put your full re-query here and
+  every reconnect refreshes your state for free.
+- **Two ways to wait, matching how your device talks.** `exchange()` is
+  request/reply for a device where every frame answers something you sent: it
+  holds the wire, sends, and returns the next frame to arrive. `expect()` waits
+  for a frame matching a predicate, for a device that reports state on its own
+  schedule — where a frame often answers nothing in particular.
 - **The transport is injected.** You give `SerialLink` an async `connect`
   factory returning a duck-typed `(reader, writer)`. In production that wraps
   `serialx.open_serial_connection`; in tests it's `serialkit.testing.FakeLink`.
@@ -153,29 +152,30 @@ Frame routing order, per arriving frame:
 
 ## Liveness
 
-Two shapes, because the device classes genuinely differ:
+Two shapes, matching how the device behaves when it is healthy:
 
 ```python
 IdleProbe(idle=60.0, probe=b"POW?;", attempts=3)  # silence is evidence
-FailureCount(consecutive=3)  # only timeouts are
+FailureCount(consecutive=3)  # unanswered commands are
 ```
 
 A device that reports state spontaneously goes quiet when the link dies, so an
-idle window detects it (`probe=None` for one chatty enough to need no poke). A
-device that emits nothing unsolicited is silent at rest, so silence proves
-nothing and only unanswered commands do — without this, an ESPHome proxy whose
-API connection dies hangs the read loop forever while you serve stale state.
+idle window catches it. Set `probe=None` for one chatty enough that silence
+alone is the signal.
 
-Liveness is judged by idle-window checkpoints ("was there any RX during this
-window?"), never a `now - last_rx` clock delta, which is flaky under scheduling
-jitter and reconnects healthy devices.
+A device that speaks only when spoken to is silent at rest, so its unanswered
+commands are the evidence instead. This is what notices a proxy whose
+connection died while the port still looks open.
+
+Both judge liveness by idle-window checkpoints — was there any RX during this
+window? — which is immune to scheduling jitter.
 
 ## Sharp edges
 
-- **`send`/`sweep`/`confirm`/`exchange` raise `ConnectionLostError` when not
-  connected** — before `start()`, during backoff, after `stop()`. Nothing
-  queues across a reconnect: a volume command delivered 60 seconds late is
-  wrong for RS232.
+- **A command either goes out now or raises `ConnectionLostError`** — before
+  `start()`, during backoff, after `stop()`. Commands are never buffered for a
+  later connection, because a volume change delivered 60 seconds late is the
+  wrong answer.
 - **Pacing is settle-after.** The interval selected for a frame is the minimum
   delay *after it is sent*. A `;`-chained command written once passes the send
   path once and is one pacing unit.
@@ -183,8 +183,8 @@ jitter and reconnects healthy devices.
   `start()` on the first attempt and triggers backoff-and-retry on a reconnect.
 - **The framer is a prototype**, deep-copied and reset per connection, so no
   connection inherits another's residual buffer.
-- **A `sweep()` has no per-frame success or failure.** An unanswered nudge is
-  simply a field that never gets an event.
+- **`sweep()` reports completion, not per-frame results.** An unanswered nudge
+  is a field that never gets an event.
 
 ## Testing
 
@@ -209,10 +209,13 @@ in the form it actually takes:
 
 `FakeClock` drives the `time_func`/`sleep_func` seam, so a 60-second idle
 window costs no real time. The seam covers the sleeps the kit *initiates* —
-pacing, backoff, the liveness window, the sweep quiet window. It deliberately
-does not cover `expect`/`confirm`/`Exchange.next` timeouts: those are deadlines
-on external events, and a clock whose `sleep` returns immediately would win
-every race against a real future and fire every timeout instantly.
+pacing, backoff, the liveness window, the sweep quiet window — which are the
+expensive ones.
+
+`expect`/`confirm`/`Exchange.next` timeouts stay on loop time, which keeps them
+accurate deadlines on external events: a clock whose `sleep` returns
+immediately would win every race against a real future and fire every timeout
+instantly. They are short by nature, so tests pass small values.
 
 ## License
 

@@ -300,11 +300,11 @@ class SerialLink:
             await link.send(POWER_ON)
             frame = await waiter
 
-        This is observation, not correlation: the frame is often an unsolicited
-        auto-report that answers nothing in particular. It **observes without
-        consuming** — a frame that satisfies the predicate is normally also a
-        state event the driver must apply, so it still reaches ``on_frame``.
-        Only :meth:`exchange` claims a frame.
+        The frame is often an unsolicited auto-report that answers nothing in
+        particular, so this **observes without consuming** — a frame that
+        satisfies the predicate is normally also a state event the driver must
+        apply, and it still reaches ``on_frame``. Only :meth:`exchange` claims
+        a frame.
         """
         return self._registry.arm(match, timeout=timeout)
 
@@ -319,9 +319,10 @@ class SerialLink:
     ) -> bytes:
         """Arm, send, wait, and retry — delivery confirmed by the device.
 
-        A frame that has not arrived yet cannot already be true, so this is an
-        honest confirmation rather than a check that can pass vacuously against
-        a state that was already correct.
+        What it returns is evidence: a frame that has not arrived yet cannot
+        already satisfy the predicate, so this resolves only on something the
+        device actually sent — never on a state that happened to be correct
+        before the command went out.
 
         ``retries`` is device knowledge the driver supplies: a standby MCU that
         consumes the first frame waking up needs its command sent twice, and

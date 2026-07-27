@@ -1,29 +1,26 @@
 """serialkit.waiting: waiting for a frame, correctly anchored.
 
-RS232 devices are overwhelmingly not request/reply. A command is
-fire-and-forget and the device reports state on its own schedule, so an
-arriving frame carries no reliable evidence of which command caused it. This
-module therefore offers **observation** and **exclusivity**, never correlation:
+Two shapes, matching how the device talks.
 
-- :class:`WaitRegistry` owns the RX sequence counter and the armed
-  ``expect`` waiters. A waiter is armed at call time — *before* the send — so a
-  reply arriving in the same read chunk as the write cannot be missed. It
-  **observes**: a resolving frame is still delivered to ``on_frame``, because
-  the frame that confirms a power-on is also the state report the driver must
-  apply.
-- :class:`Exchange` holds the wire exclusively for one send-and-read round, for
-  devices whose replies are only decodable in the context of the outstanding
-  command. It **consumes**: a claimed frame does not reach ``on_frame``.
+- :class:`Exchange` is request/reply, for a device where every frame is caused
+  by something sent. It holds the wire exclusively for one send-and-read round,
+  so the reply to the outstanding command is unambiguous. It **consumes**: a
+  claimed frame does not reach ``on_frame``.
+- :class:`WaitRegistry` owns the armed ``expect`` waiters, for a device that
+  reports state on its own schedule. A waiter is armed at call time — *before*
+  the send — so a reply arriving in the same read chunk as the write cannot be
+  missed. It **observes**: a resolving frame is still delivered to
+  ``on_frame``, because the frame that confirms a power-on is also the state
+  report the driver must apply.
 
-Exchange replies are anchored by arrival order rather than content, because
-arrival order is the only discriminator such a protocol has. ``send()`` records
-the RX counter at the moment the frame goes on the wire — after pacing, not
-before it — and ``next()`` accepts only a strictly greater index. A late reply
-to a previous, timed-out exchange therefore lands *behind* the anchor and is
-discarded rather than being read as this exchange's answer. This is the classic
-serial desync, and a content matcher cannot express the fix: when replies carry
-no identifier the two frames are byte-identical, and only arrival order
-distinguishes them.
+It also owns the RX sequence counter, which is how an exchange knows its reply
+from a stale one. ``send()`` records the counter at the moment the frame goes
+on the wire — after pacing, not before it — and ``next()`` accepts only a
+strictly greater index. A late reply to a previous, timed-out exchange
+therefore lands *behind* the anchor and is discarded rather than being read as
+this exchange's answer. Arrival order is the discriminator because it is the
+one these protocols reliably give you: when replies carry no identifier, the
+stale frame and the real one are byte-identical.
 
 Frame routing order, per arriving frame:
 
