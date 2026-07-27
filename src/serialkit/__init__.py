@@ -1,17 +1,14 @@
-"""serialkit: an asyncio robustness toolkit for RS232 device drivers.
+"""serialkit: wire mechanics for RS232 device drivers.
 
-OTP-inspired single-dispatch-task internals (framing, request/response
-correlation, pacing, reconnect, an opt-in liveness watchdog) behind an
-``asyncio.Protocol``-flavoured callback API. Subclass :class:`SerialDevice`,
-declare config as class attributes, and override the lifecycle callbacks; or
-drop to the primitives (:class:`PendingTracker`, the framers, :class:`Pacing`)
-when a protocol needs bespoke handling.
+Framing, pacing, exclusivity, sequence anchoring, dispatch, reconnect and
+liveness — behind an ``asyncio.Protocol``-flavoured callback surface. The kit
+knows nothing about any device: no commands, no responses, no state. A driver
+implements :class:`DeviceHandler`, owns a :class:`SerialLink`, and keeps its
+device model to itself.
 """
 
 from __future__ import annotations
 
-from .correlate import Matcher, PendingTracker, match_predicate, match_prefix
-from .device import Backoff, ProbeSpec, SerialDevice
 from .errors import (
     CommandTimeoutError,
     ConnectionLostError,
@@ -19,12 +16,8 @@ from .errors import (
     ResyncError,
     SerialKitError,
 )
-from .framing import (
-    DelimiterFramer,
-    Framer,
-    LengthPrefixedFramer,
-    RegexResyncFramer,
-)
+from .framing import DelimiterFramer, Framer, RegexResyncFramer
+from .link import Backoff, DeviceHandler, FailureCount, IdleProbe, SerialLink
 from .pacing import Pacing
 
 __all__ = [
@@ -32,17 +25,14 @@ __all__ = [
     "CommandTimeoutError",
     "ConnectionLostError",
     "DelimiterFramer",
+    "DeviceHandler",
+    "FailureCount",
     "Framer",
-    "LengthPrefixedFramer",
-    "Matcher",
+    "IdleProbe",
     "Pacing",
-    "PendingTracker",
-    "ProbeSpec",
     "ProtocolError",
     "RegexResyncFramer",
     "ResyncError",
-    "SerialDevice",
     "SerialKitError",
-    "match_predicate",
-    "match_prefix",
+    "SerialLink",
 ]

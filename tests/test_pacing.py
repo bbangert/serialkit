@@ -1,61 +1,55 @@
-"""Pacing regression scenarios (deterministic via FakeClock)."""
+"""Pacing interval selection.
+
+``Pacing`` is pure config: it answers "how long must the wire settle after
+this frame". The timing behaviour built on those answers (the send lock, the
+next-allowed timestamp, the actual sleep) lives in ``SerialLink`` and is
+covered by ``test_link_pacing.py``.
+"""
 
 from __future__ import annotations
+
+import dataclasses
 
 import pytest
 
 from serialkit import Pacing
 
-from conftest import FakeClock
+
+def test_default_pacing_is_no_delay() -> None:
+    assert Pacing().interval_for(b"MV50") == 0.0
 
 
-def make_pacing(clock: FakeClock, **kwargs: object) -> Pacing:
-    return Pacing(time_func=clock.time, sleep_func=clock.sleep, **kwargs)
+def test_min_interval_applies_to_any_frame() -> None:
+    pacing = Pacing(min_interval=0.1)
+    assert pacing.interval_for(b"MV50") == pytest.approx(0.1)
+    assert pacing.interval_for(b"PWON") == pytest.approx(0.1)
 
 
-async def send(
-    pacing: Pacing, clock: FakeClock, frame: bytes, pace: float | None = None
-) -> float:
-    """Send through the locked path; returns the time the write happened."""
-    async with pacing.send_slot(frame, pace=pace):
-        return clock.time()
+def test_per_command_longest_prefix_wins() -> None:
+    pacing = Pacing(min_interval=0.1, per_command={b"PW": 0.5, b"PWON": 1.0})
+    assert pacing.interval_for(b"PWON") == pytest.approx(1.0)
+    assert pacing.interval_for(b"PWSTANDBY") == pytest.approx(0.5)
+    assert pacing.interval_for(b"MV50") == pytest.approx(0.1)
 
 
-async def test_three_rapid_sends_respect_min_interval(clock: FakeClock) -> None:
-    pacing = make_pacing(clock, min_interval=0.1)
-    t1 = await send(pacing, clock, b"MV50")
-    t2 = await send(pacing, clock, b"MV51")
-    t3 = await send(pacing, clock, b"MV52")
-    assert t1 == 0.0
-    assert t2 == pytest.approx(0.1)
-    assert t3 == pytest.approx(0.2)
+def test_per_send_override_beats_per_command() -> None:
+    pacing = Pacing(min_interval=0.1, per_command={b"PW": 0.5})
+    assert pacing.interval_for(b"PWON", pace=2.0) == pytest.approx(2.0)
+    assert pacing.interval_for(b"PWON", pace=0.0) == 0.0
 
 
-async def test_per_command_longest_prefix_wins(clock: FakeClock) -> None:
-    pacing = make_pacing(
-        clock, min_interval=0.1, per_command={b"PW": 0.5, b"PWON": 1.0}
-    )
-    t1 = await send(pacing, clock, b"PWON")   # longest prefix -> 1.0 settle
-    t2 = await send(pacing, clock, b"PWSTANDBY")  # only b"PW" matches -> 0.5
-    t3 = await send(pacing, clock, b"MV50")   # no prefix -> min_interval
-    t4 = await send(pacing, clock, b"MV51")
-    assert t2 - t1 == pytest.approx(1.0)
-    assert t3 - t2 == pytest.approx(0.5)
-    assert t4 - t3 == pytest.approx(0.1)
+def test_chained_command_inherits_its_leading_prefix() -> None:
+    """A ;-chained write is ONE frame, so it selects one interval — the one
+    for the prefix it starts with, not the sum of its subcommands."""
+    pacing = Pacing(min_interval=0.1, per_command={b"POW": 1.0})
+    assert pacing.interval_for(b"POW?;VOL?;MUT?") == pytest.approx(1.0)
+    assert pacing.interval_for(b"VOL?;POW?") == pytest.approx(0.1)
 
 
-async def test_per_send_override_beats_per_command(clock: FakeClock) -> None:
-    pacing = make_pacing(clock, min_interval=0.1, per_command={b"PW": 0.5})
-    t1 = await send(pacing, clock, b"PWON", pace=2.0)
-    t2 = await send(pacing, clock, b"MV50")
-    assert t2 - t1 == pytest.approx(2.0)
-
-
-async def test_chained_command_is_one_pacing_unit(clock: FakeClock) -> None:
-    """A ;-chained write goes through the send path once: two chained
-    frames are spaced by ONE interval, not one per subcommand."""
-    pacing = make_pacing(clock, min_interval=0.1)
-    t1 = await send(pacing, clock, b"Z1POW?;Z1VOL?;Z1MUT?")
-    t2 = await send(pacing, clock, b"Z1SIM?;Z1AIC?")
-    assert t2 - t1 == pytest.approx(0.1)
-    assert clock.sleeps == [pytest.approx(0.1)]  # exactly one pacing delay
+def test_pacing_is_frozen_and_shareable() -> None:
+    """Frozen and lock-free, so a module-level Pacing constant is safe to
+    share between links."""
+    pacing = Pacing(min_interval=0.1)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        pacing.min_interval = 0.2  # type: ignore[misc]
+    assert Pacing(min_interval=0.1) == pacing  # value semantics

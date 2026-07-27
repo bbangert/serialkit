@@ -1,81 +1,160 @@
 # serialkit
 
-Asyncio robustness toolkit for RS232 device drivers. Not a device library — a
-reusable substrate the device libraries (`sony-tv-rs232`, `denon-rs232`,
-`lg-rs232-tv`, `anthem-rs232`) build on so each one stops hand-rolling framing,
-read loops, watchdogs, reconnect, and request/response correlation.
+Wire mechanics for RS232 device drivers. Not a device library — the substrate
+each `<device>-rs232` library builds on for framing, the read loop, pacing,
+liveness, reconnect, and the anchoring that keeps a late reply from being read
+as the next command's answer.
+
+**serialkit is generic.** It names no manufacturer, model, or command
+vocabulary anywhere — not in code, docstrings, tests, or docs. Where a real
+device motivated a design decision, record the *device behaviour* that forced
+it ("a device asleep in standby consumes the first frame waking up"), never the
+brand. Device-specific knowledge belongs one layer up.
+
+Published to PyPI as **`serial-toolkit`** (the name `serialkit` is blocked
+there); the import package is `serialkit`.
+
+## The three layers
+
+| Layer | Owns | Does not own |
+| --- | --- | --- |
+| **serialkit** | Framing, pacing, exclusivity, sequence anchoring, dispatch, reconnect, liveness. Tells the caller when a connection opens and drops. | Any knowledge of a device, a command, or a response. No state. |
+| **`<device>-rs232`** | The device: what commands go in, what comes out, how a frame decodes into a typed event, the full re-query on connect, and the device model. | Home Assistant concepts, entity mapping. |
+| **`<device>-rs232-hass`** | The projection of the device model onto HA: entities, `_attr_*`, availability, unit conversion. | Framing, pacing, reconnect, protocol encoding, or a second copy of the model. |
+
+**Mechanism vs policy is the sharp edge between layers 1 and 2.** The kit
+provides *waiting for a frame matching a predicate*, correctly anchored, plus
+exclusivity, pacing, and the retry loop. The driver supplies the predicate, the
+frames, the retry count, and the interpretation. "This device needs
+`retries=1` because its standby MCU eats the first frame" is device knowledge;
+the loop implementing it is not.
 
 ## Project structure
 
 ```
 src/serialkit/
-  __init__.py    -- Re-exports the public API
+  __init__.py    -- the public surface (14 names)
   errors.py      -- SerialKitError -> ConnectionLostError / CommandTimeoutError
                     / ProtocolError / ResyncError (drivers subclass ProtocolError)
-  framing.py     -- Framer protocol + DelimiterFramer / RegexResyncFramer /
-                    LengthPrefixedFramer (bespoke protocols ship their own Framer)
-  correlate.py   -- PendingTracker: matcher-based (never FIFO) request/response
-                    correlation with a max_in_flight slot gate
-  pacing.py      -- Pacing: settle-after minimum spacing, per-command overrides
-  device.py      -- SerialDevice[S] runtime + Backoff + ProbeSpec
+  framing.py     -- Framer protocol + DelimiterFramer / RegexResyncFramer
+                    (bespoke protocols ship their own Framer)
+  pacing.py      -- Pacing: a frozen settle-after policy, per-command overrides
+  link.py        -- SerialLink runtime + DeviceHandler + Backoff + IdleProbe
+                    + FailureCount
+  waiting.py     -- the frame-waiter registry, the RX counter, and Exchange
+  testing.py     -- FakeLink / FakeClock / FakeReader / FakeWriter
 
 tests/
-  conftest.py            -- FakeClock, FakeReader/Writer, FakeLink, DictDevice
-  test_framing.py        -- framer split/NUL/oversize/reset scenarios
-  test_pacing.py         -- deterministic fake-clock pacing scenarios
-  test_teardown.py       -- fail_all + slot release + cancellation
-  test_desync.py         -- sony desync regression (gated vs FIFO contrast)
-  test_errors_routing.py -- gen1/gen2 error-frame rejection in on_frame
-  test_device_runtime.py -- handshake, reconnect-rebuild, sony ordering,
-                            burst notify coalescing, probe watchdog, stop()
+  conftest.py               -- fixtures + the recording Recorder handler
+  test_framing.py           -- framer split/NUL/oversize/reset scenarios
+  test_framing_vectors.py   -- byte vectors shaped like the real protocols
+  test_pacing.py            -- interval selection as a pure function
+  test_testing_doubles.py   -- the fault shapes the doubles must reproduce
+  test_link_runtime.py      -- start/dispatch/turns/reconnect/teardown pins
+  test_waiting.py           -- arming, routing order, RX anchoring
+  test_liveness.py          -- both liveness shapes, sweep, link-level pacing
 ```
 
 ## Architecture
 
+- **The driver owns a link and implements `DeviceHandler`.** That keeps the
+  kit out of the driver's namespace, makes per-instance config (a
+  model-dependent baud rate) ordinary, and lets each library name its own
+  public API.
+- **`SerialLink` is not generic and holds no device data.** It never sees a
+  command, a response, or a state object. The device model belongs to the
+  driver: the event loop is single-threaded, so there is no interleaving for
+  snapshots to guard, and diffing to detect change would rediscover at copy
+  time what the driver already knew at mutation time.
 - **Single dispatch task per connection.** It reads the transport, frames each
-  chunk, and calls the sync `on_frame` callback per frame (exception-hardened —
-  a driver crash on one frame never kills the loop or the next frame). At most
-  one coalesced subscriber notification is delivered per dispatch turn.
-- **Callback surface, OTP-inspired internals.** Drivers subclass
-  `SerialDevice[S]`, declare config as class attributes (`framer_factory`,
-  `pacing`, `probe`, `backoff`, `max_in_flight`, `request_timeout`), and
-  override `make_state` / `on_connect` / `on_frame` / `on_disconnect` /
-  `copy_state`.
+  chunk, calls the sync `on_frame` per frame (exception hardened), then
+  `on_turn` once for the chunk. `on_turn` is the one thing a driver cannot
+  compute for itself, because only the kit knows where a chunk's frames stop —
+  it is the coalescing point where a driver flushes queued events.
 - **Transport is injected** as an async `connect` factory returning a
   duck-typed `(reader, writer)` pair, so the runtime is testable without real
   hardware and works with any `serialx` URL (local, `socket://`, `esphome://`).
-- **Kit-owned reconnect loop.** On read error / EOF / probe failure: `fail_all`
-  pending → `on_disconnect(exc)` → `notify(None)` → backoff → fresh framer +
-  fresh `make_state()` state → `on_connect` → `notify`. State is rebuilt per
-  connection; nothing is preserved across a reconnect.
-- **Watchdog is opt-in** via the `probe` class attribute, using jitter-immune
-  idle-window checkpoints (any RX in the window = alive), never a clock delta.
+- **Kit-owned reconnect loop**, and `on_connect` runs on **every** connection
+  with frames already flowing. That is where the driver re-queries: staleness
+  after a reconnect is a protocol problem solved by asking the device again,
+  not a state-lifecycle problem.
+- **Liveness is opt-in and comes in two shapes**, because the device classes
+  differ. A publisher going quiet is evidence (`IdleProbe`); a transactional
+  device is silent at rest, so only unanswered commands are (`FailureCount`).
+
+## Waiting: three primitives, no correlation
+
+RS232 devices are overwhelmingly not request/reply. Commands are
+fire-and-forget and the device reports state on its own schedule, so an
+arriving frame has no guaranteed causal link to anything sent. The kit
+therefore offers observation and exclusivity, never matcher correlation.
+
+- `expect(match, timeout)` arms a waiter **at call time**, so it can be armed
+  before the send and a same-chunk reply is never lost. It **observes without
+  consuming**: a matching frame still reaches `on_frame`, because the frame
+  confirming a power-on is also the state report the driver must apply.
+- `confirm(nudge=…, match=…, timeout=…, retries=…)` arms, sends, waits,
+  retries. A frame that has not arrived yet cannot already be true, so this is
+  an honest delivery confirmation rather than a check that passes vacuously.
+- `exchange()` holds the wire exclusively and **claims** the frames it reads,
+  for a device whose replies are only decodable against the outstanding
+  command.
+- `sweep(frames)` sends everything under pacing then waits for silence — the
+  bulk refresh for a publisher. No per-frame success or failure.
+
+Frame routing order, per arriving frame:
+
+1. an open exchange that is expecting a reply **claims** it;
+2. otherwise every armed `expect` waiter whose predicate matches resolves;
+3. `on_frame(frame)` runs regardless of step 2.
 
 ## Load-bearing contracts (do not regress)
 
-- **Correlation is matcher-based, never positional.** FIFO correlation is the
-  sony production desync: a dropped/garbled answer shifts every later response.
-- **`max_in_flight=1` gates write AND response-wait** — a second command isn't
-  even written while the first is owed a reply.
-- **Timeout starts at slot acquisition, and a paced write is abandoned if its
-  pending completed while queued behind pacing.** Emitting a frame whose
-  pending is gone puts an untracked command on the wire — the desync again.
-- **A request caller resumes strictly after the dispatch turn containing its
-  response frame** (single-loop sync granularity makes caller-task state
-  mutation safe).
-- **`notify(None)` discards any dirty-but-unflushed snapshot** so a stale
-  snapshot can never follow `None`.
-- **`framer_factory` must be a `staticmethod`.**
+- **An exchange reply is anchored by arrival order, recorded at write time —
+  after pacing, not before it.** This is the structural fix for the classic
+  serial desync: a late reply to a previous, timed-out exchange arriving while
+  the next command waits its pacing turn lands behind the anchor and is
+  discarded. A content matcher cannot express this, because when replies carry
+  no identifier the two frames are byte-identical.
+- **`expect()` observes, `exchange()` consumes.** Getting this backwards
+  silently drops state updates.
+- **Nothing queues across a reconnect.** `send`/`sweep`/`confirm`/`exchange`
+  fail immediately when not connected; a volume command delivered 60 seconds
+  late is wrong for RS232.
+- **A write is abandoned if the session changed while it was queued behind
+  pacing** — a stale frame must never land on a new session's writer.
+- **Reconnect fails all in-flight waits before `on_disconnect`**, or the next
+  exchange deadlocks on the wire lock.
+- **The runtime owns framer reset**, never the framer, and still routes the
+  frames completed before a `ResyncError`.
+- **`on_turn` fires once per chunk that produced at least one frame**, and not
+  at all for a chunk that produced none.
+- **The framer is a prototype instance**, deep-copied and reset per connection.
+- **The clock seam covers the sleeps the kit initiates** — pacing, backoff, the
+  liveness idle window, the sweep quiet window. It deliberately does *not*
+  cover `expect`/`confirm`/`Exchange.next` timeouts: those are deadlines on
+  external events, and a virtual clock whose `sleep` returns immediately would
+  win every race against a real future and fire every timeout instantly.
 
-Escape hatch: when `SerialDevice` doesn't fit, drop to the primitives
-(`PendingTracker`, a `Framer`, `Pacing`) directly.
+Escape hatch: when `SerialLink` doesn't fit (a one-shot tool, a runtime that
+already owns the read loop), drop to the primitives — the framers, `Pacing`,
+`WaitRegistry` — directly.
 
 ## Testing
 
 - `pytest` with `pytest-asyncio`, `asyncio_mode = "auto"`; `RuntimeWarning` is
   promoted to an error so un-awaited futures/coroutines fail the suite.
-- No test requires real hardware: `FakeLink` is an injected connect factory
-  with scriptable responses; `FakeClock` makes pacing deterministic.
+- No test requires real hardware. `FakeLink` is an injected connect factory
+  that reproduces the transport fault shapes as they actually occur: EOF for a
+  socket FIN, a raised `OSError` for a serial unplug, and a *silent* write
+  failure where `write()` and `drain()` both return normally and the frame
+  simply never goes out.
+- `FakeClock` makes a 60-second idle window cost no real time.
 - Run under the target Python (PEP 758 makes some 3.13 mypy/compile findings
-  false positives): `uv run --python 3.14 pytest`,
-  `uvx --python 3.14 mypy@latest --strict src/`, `uvx ruff check`.
+  false positives):
+
+  ```bash
+  uv run --python 3.14 pytest
+  uvx --python 3.14 mypy@latest --strict src/
+  uvx ruff check && uvx ruff format --check
+  ```
