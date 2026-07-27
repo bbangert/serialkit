@@ -4,16 +4,15 @@
 [![PyPI](https://img.shields.io/pypi/v/serial-toolkit.svg)](https://pypi.org/project/serial-toolkit/)
 [![Python](https://img.shields.io/pypi/pyversions/serial-toolkit.svg)](https://pypi.org/project/serial-toolkit/)
 
-Asyncio robustness toolkit for RS232 device drivers, built on
+Wire mechanics for RS232 device drivers, built on
 [serialx](https://github.com/puddly/serialx).
 
-Serial device libraries keep hand-rolling the same hard parts — framing a byte
-stream, correlating responses to requests, pacing writes, running a read loop,
-a liveness watchdog, and reconnect. serialkit provides those once, correctly,
-behind an `asyncio.Protocol`-flavoured callback API. Subclass `SerialDevice`,
-declare a little config, and override a few callbacks; or drop to the
-primitives (`PendingTracker`, the framers, `Pacing`) when a protocol needs
-bespoke handling.
+serialkit handles framing a byte stream, pacing writes, the read loop, liveness,
+reconnect, and the anchoring that keeps a late reply from being read as the next
+command's answer — behind an `asyncio.Protocol`-flavoured callback API.
+
+Your driver **owns** a `SerialLink` and implements `DeviceHandler`. The kit
+stays out of your namespace, and your library names its own public API.
 
 ## Installation
 
@@ -27,212 +26,193 @@ pip install 'serial-toolkit[esphome]'
 The distribution is named `serial-toolkit` on PyPI; the import package is
 `serialkit` (`import serialkit`). Requires Python 3.14+.
 
+## Scope
+
+serialkit owns the wire: framing, pacing, exclusivity, sequence anchoring,
+dispatch, reconnect, and liveness.
+
+It has **no knowledge of any device** — no commands, no responses, no state.
+`SerialLink` is not generic; your device model stays in your library as an
+ordinary attribute, with no kit contract attached to it.
+
 ## Concepts
 
 - **One dispatch task per connection.** It reads the transport, frames each
-  chunk, and calls your sync `on_frame` once per frame. A crash in `on_frame`
-  is recorded and swallowed — it never kills the loop or the next frame.
-- **Correlation is matcher-based, never positional.** You register what a
-  response looks like (`match_prefix(b"POW")`); the kit resolves the oldest
-  in-flight request whose matcher accepts an incoming frame. Positional (FIFO)
-  correlation is the classic desync: one dropped answer shifts every reply.
-- **The transport is injected.** You give `SerialDevice` an async `connect`
+  chunk, and calls your sync `on_frame` once per frame in order. A crash in
+  `on_frame` is recorded in `frame_errors` and swallowed — it never kills the
+  loop or the next frame.
+- **`on_turn()` is the coalescing point.** It fires once after all the frames
+  from one read chunk have been dispatched. This is the one thing you cannot
+  compute for yourself, because only the kit knows where a chunk's frames stop.
+  Flush your queued events to subscribers here.
+- **`on_connect()` runs on *every* connection**, with frames already flowing —
+  so `send`, `sweep`, `expect` and `exchange` all work inside it. Run your full
+  re-query here. Stale data after a reconnect is a protocol problem: ask the
+  device again and fresh events overwrite whatever you held.
+- **No correlation, because these devices aren't request/reply.** A command is
+  fire-and-forget and the device reports state on its own schedule, so an
+  arriving frame has no guaranteed causal link to anything you sent. You get
+  observation and exclusivity instead (see below).
+- **The transport is injected.** You give `SerialLink` an async `connect`
   factory returning a duck-typed `(reader, writer)`. In production that wraps
   `serialx.open_serial_connection`; in tests it's `serialkit.testing.FakeLink`.
-- **State is rebuilt per connection.** On reconnect the kit calls `make_state`
-  again; nothing survives across a drop, so subscribers never see stale fields.
 
 ## Minimal driver
 
 ```python
 from serialx import open_serial_connection
 
-from serialkit import DelimiterFramer, SerialDevice, match_prefix
+from serialkit import DelimiterFramer, IdleProbe, Pacing, SerialLink
+
+QUERY_FRAMES = [b"POW?;", b"VOL?;", b"MUT?;"]
 
 
-class MyTv(SerialDevice[dict]):
-    framer_factory = staticmethod(lambda: DelimiterFramer(b"\r"))
-    max_in_flight = 1                       # one command owed a reply at a time
+class MyReceiver:
+    def __init__(self, port: str) -> None:
+        self.state = ReceiverState()
+        self.link = SerialLink(
+            connect=lambda: open_serial_connection(url=port, baudrate=115200),
+            framer=DelimiterFramer(b";", strip=b"\x00"),
+            handler=self,
+            pacing=Pacing(min_interval=0.03),
+            liveness=IdleProbe(idle=60.0, probe=b"POW?;", attempts=3),
+        )
+        self._events: list[Event] = []
 
-    @classmethod
-    def open(cls, url: str) -> "MyTv":
-        async def connect():
-            return await open_serial_connection(url=url, baudrate=9600)
-        return cls(connect)
-
-    def make_state(self) -> dict:
-        return {}
-
-    async def on_connect(self) -> None:
-        await self.query_power()             # frames are already flowing here
+    # ---- the DeviceHandler callbacks ----
 
     def on_frame(self, frame: bytes) -> None:
-        if frame.startswith(b"POW"):
-            self.state["power"] = frame[3:] == b"1"
-            self.notify()
-        if not self.pending.feed(frame):
-            ...  # an unsolicited event: update state + self.notify()
+        event = parse_event(frame)  # a pure function you can unit-test
+        if event is not None:
+            apply_event(self.state, event)  # ...and so is this
+            self._events.append(event)
 
-    async def query_power(self) -> bytes:
-        return await self.request(b"POW?\r", match_prefix(b"POW"))
+    def on_turn(self) -> None:
+        events, self._events = self._events, []
+        for subscriber in self._subscribers:
+            subscriber(events)  # one callback per turn, batched
+
+    async def on_connect(self) -> None:
+        await self.link.send(b"ECH1;")  # enable auto-reports
+        await self.link.sweep(QUERY_FRAMES)  # the full refresh
+
+    def on_disconnect(self, exc: Exception | None) -> None:
+        for subscriber in self._subscribers:
+            subscriber([Disconnected(reason=exc)])  # consumers go unavailable
+
+    # ---- your public API ----
+
+    async def set_volume(self, db: float) -> None:
+        await self.link.send(f"VOL{db:g};".encode())
+
+    async def power_on(self) -> None:
+        # Send, wait ~1s, send again: a standby MCU consumes the first frame
+        # waking up, so the second one is what acts.
+        await self.link.confirm(
+            nudge=b"POW1;",
+            match=lambda f: f.startswith(b"POW"),
+            timeout=1.0,
+            retries=1,
+        )
 ```
+
+`on_turn` and `on_disconnect` are optional — omit them if you don't need them.
+
+## Waiting for a frame
 
 ```python
-tv = MyTv.open("/dev/ttyUSB0")
-await tv.start()
-tv.subscribe(lambda state: print("state:", state))
-await tv.query_power()
-await tv.stop()
+# Arm BEFORE the send, so a reply in the same read chunk isn't missed.
+waiter = link.expect(is_power_report, timeout=1.0)
+await link.send(b"POW1;")
+frame = await waiter
 ```
 
-## The callback contract
+`expect()` **observes without consuming**: the frame still reaches `on_frame`,
+because the frame that confirms a power-on is also the state report you must
+apply. `confirm()` is the wrapper that arms, sends, waits, and retries.
 
-### Config (class attributes)
+For a device whose replies carry no identifier and are only decodable against
+the outstanding command, hold the wire instead:
 
-| Attribute | Default | Meaning |
-| --- | --- | --- |
-| `framer_factory` | *(required)* | A zero-arg callable **or** a `Framer` instance used as a prototype. A fresh framer is built per connection. A plain-function factory is read off the class, so `staticmethod` is optional but conventional. |
-| `pacing` | `None` | A `Pacing` policy; `None` means no spacing. Declared as a class attribute, it is cloned per instance (its lock and clock are never shared). |
-| `probe` | `None` | A `ProbeSpec` opt-in liveness watchdog; `None` means no watchdog. |
-| `backoff` | `Backoff()` | Reconnect delay policy (`initial * factor**tries`, capped). |
-| `max_in_flight` | `None` | Slot gate. `1` refuses to even write a second command while the first is owed a reply. `None` is unlimited. |
-| `request_timeout` | `3.0` | Default per-request deadline (seconds). |
-
-### Lifecycle callbacks (override)
-
-- `make_state(self) -> S` — build fresh state for a new connection.
-- `async on_connect(self) -> None` — handshake / verify / initial query. The
-  dispatch task is already live, so `await self.request(...)` works here and is
-  the idiomatic handshake.
-- `on_frame(self, frame: bytes) -> None` — **sync**, runs on the dispatch task,
-  one call per frame in order. You decide the ordering of state mutation vs
-  `self.pending.feed(frame)`.
-- `on_disconnect(self, exc: Exception | None) -> None` — optional; runs before
-  a reconnect (`exc` set) and on `stop()` (`exc=None`).
-- `copy_state(self, state: S) -> S` — snapshot for subscribers; defaults to
-  `copy.deepcopy`. Override with a cheaper `.copy()` for dataclasses.
-
-### Facilities (call / read)
-
-- `state: S` — the live state object; mutate it from callbacks or command
-  methods.
-- `pending: PendingTracker` — `feed(frame)` resolves a matching request
-  (returns `False` if unsolicited); `reject_matched(key, exc, *, all=)` and
-  `reject_oldest(exc)` fail requests on an error frame.
-- `async request(frame, matcher, *, timeout=None, pace=None) -> bytes` —
-  slot-gated, paced request; returns the correlated response frame.
-- `async send(frame, *, pace=None) -> None` — paced write, no reply expected.
-- `notify() -> None` — request a coalesced snapshot to subscribers (at most one
-  per dispatch turn). Call it after you change `state`.
-- `batch()` — context manager coalescing a burst of awaited requests into a
-  single notification (`with self.batch(): await self.query_all()`).
-- `subscribe(cb) -> unsubscribe` — `cb` receives an `S` snapshot, or `None` on
-  disconnect.
-- `async start()` / `async stop()` — open (and supervise) / tear down.
-- `connected: bool`.
-
-### Pinned semantics (the sharp edges)
-
-- **A request caller resumes strictly after the dispatch turn containing its
-  response.** Mutating `state` right after `await self.request(...)` lands on
-  top of everything that turn dispatched — safe at single-loop granularity.
-- **A paced write is abandoned if its request already completed** (timeout /
-  disconnect) while it was queued behind pacing. The kit never puts an
-  untracked command on the wire — that is the desync `max_in_flight` prevents.
-- **`request()`/`send()` raise `ConnectionLostError` immediately when not
-  connected** (before `start()`, during backoff, after `stop()`). No queueing
-  across reconnects.
-- **`notify(None)` (disconnect) discards any unflushed snapshot** — subscribers
-  never see a stale snapshot after `None`.
-- **A sequential burst of awaited requests notifies once per response** —
-  dispatch-turn coalescing only merges answers that arrive in one chunk. Use
-  `batch()` to collapse a sequential burst.
-
-## Connection lifecycle
-
-```
-start()
-  └─ connect ─ make_state ─ [dispatch task up] ─ on_connect ─ notify ─┐
-                                                                       │
-        ┌──────────────────── supervised session ────────────────────┘
-        │   read → framer.feed → on_frame per frame → coalesced notify
-        │   request()/send() from command methods
-        │
-        ├─ read error / EOF / probe timeout ─┐
-        │                                     ▼
-        │   fail_all(pending) ─ on_disconnect(exc) ─ notify(None)
-        │        └─ backoff(1.8**tries, cap 60s) ─ fresh framer + make_state
-        │                        └─ on_connect ─ notify ─┐
-        │                                                 │
-        └─────────────────── loop ◄───────────────────────┘
-
-stop()  → fail_all(pending) ─ on_disconnect(None) ─ notify(None) ─ (no reconnect)
+```python
+async with link.exchange() as ex:
+    await ex.send(encode_query(fn))
+    frame = await ex.next(timeout=2.0)
 ```
 
-## Migrating a hand-rolled driver (skeleton)
+An exchange **claims** the frames it reads, so they do not reach `on_frame`.
+Its reply is anchored by arrival order, recorded at write time: a late reply to
+a previous, timed-out exchange lands behind the anchor and is discarded rather
+than being read as this one's answer.
 
-The five device libraries this toolkit serves each hand-roll the machinery
-below. Migration replaces it with kit facilities:
+Frame routing order, per arriving frame:
 
-| Hand-rolled today | Replace with |
-| --- | --- |
-| Read loop (`while: reader.read` + buffer split) | `framer_factory` + `on_frame` |
-| FIFO `pending.pop(0)` correlation | `pending.feed(frame)` + matchers |
-| `asyncio.sleep(...)` between sends | `pacing = Pacing(min_interval=...)` |
-| Manual reconnect / backoff task | kit reconnect loop (on by default) |
-| Bespoke keepalive / heartbeat | `probe = ProbeSpec(...)` (opt-in) |
-| `connect()` + `query_state()` wiring | `on_connect` owns `query_state` |
-| `subscribe`/notify bookkeeping | `subscribe` + `notify` + `batch` |
-| Custom exception hierarchy | subclass `ProtocolError` |
+1. an open exchange that is expecting a reply **claims** it;
+2. otherwise every armed `expect` waiter whose predicate matches resolves;
+3. `on_frame(frame)` runs regardless of step 2.
 
-Steps: (1) subclass `SerialDevice[YourState]`; (2) move framing into a
-`Framer`; (3) turn each `set_*`/`query_*` into `await self.request(...)` +
-state mutation + `notify()`; (4) delete the read loop, the sleeps, and the
-reconnect task; (5) point the HA coordinator's `except` at the kit error types.
-See `sony-tv-rs232` for the first worked migration.
+## Liveness
 
-## When to drop to primitives
+Two shapes, because the device classes genuinely differ:
 
-`SerialDevice` is the right default. Reach past it to the primitives when:
+```python
+IdleProbe(idle=60.0, probe=b"POW?;", attempts=3)  # silence is evidence
+FailureCount(consecutive=3)  # only timeouts are
+```
 
-- The protocol can't be expressed by the general framers (e.g. sony's
-  checksum-discriminated short-ack vs long frame) — write your own `Framer`
-  (it's just `feed(data) -> list[bytes]` + `reset()`), but still hand it to
-  `SerialDevice`.
-- You need correlation or pacing outside a connection lifecycle (a one-shot
-  probe tool, a discovery scan) — use `PendingTracker` / `Pacing` directly.
-- You are embedding serial handling into an existing runtime that already owns
-  the read loop — use the framer + tracker and skip the dispatch task.
+A device that reports state spontaneously goes quiet when the link dies, so an
+idle window detects it (`probe=None` for one chatty enough to need no poke). A
+device that emits nothing unsolicited is silent at rest, so silence proves
+nothing and only unanswered commands do — without this, an ESPHome proxy whose
+API connection dies hangs the read loop forever while you serve stale state.
 
-The primitives (`PendingTracker`, `DelimiterFramer` / `RegexResyncFramer` /
-`LengthPrefixedFramer`, `Pacing`) are public and independently usable.
+Liveness is judged by idle-window checkpoints ("was there any RX during this
+window?"), never a `now - last_rx` clock delta, which is flaky under scheduling
+jitter and reconnects healthy devices.
+
+## Sharp edges
+
+- **`send`/`sweep`/`confirm`/`exchange` raise `ConnectionLostError` when not
+  connected** — before `start()`, during backoff, after `stop()`. Nothing
+  queues across a reconnect: a volume command delivered 60 seconds late is
+  wrong for RS232.
+- **Pacing is settle-after.** The interval selected for a frame is the minimum
+  delay *after it is sent*. A `;`-chained command written once passes the send
+  path once and is one pacing unit.
+- **A raise from `on_connect` fails the connection** — it propagates out of
+  `start()` on the first attempt and triggers backoff-and-retry on a reconnect.
+- **The framer is a prototype**, deep-copied and reset per connection, so no
+  connection inherits another's residual buffer.
+- **A `sweep()` has no per-frame success or failure.** An unanswered nudge is
+  simply a field that never gets an event.
 
 ## Testing
 
-`serialkit.testing` ships the transport doubles so drivers never touch real
-hardware:
+`serialkit.testing` ships the doubles, so nothing needs real hardware:
 
 ```python
-from serialkit.testing import FakeLink
-
 link = FakeLink()
-link.respond({b"POW?\r": b"POW1\r"})   # script a device answer
-dev = MyTv(link.connect)
+link.respond({b"POW?\r": b"POW1\r"})
+dev = MyDevice(link.connect)
 await dev.start()
-assert link.sent == [b"POW?\r"]        # assert what was written
-link.garble()                          # inject a corrupt burst (desync test)
-link.drop()                            # EOF -> exercise reconnect
 ```
 
-`FakeClock` makes `Pacing` deterministic (`sleep` advances virtual time).
+The fault shapes match what real transports do, so a recovery path is exercised
+in the form it actually takes:
 
-## Development
+| | |
+| --- | --- |
+| `drop()` | EOF (`b""`) — the socket-family graceful FIN |
+| `drop(abrupt=True)` | `read()` raises `OSError(EIO)` — a serial unplug |
+| `fail_writes(silent=True)` | writes accepted and discarded, reproducing the fd transport where a failed `os.write` returns normally |
+| `hang_connect()` | a connect that never resolves, for `connect_timeout` |
 
-```bash
-uv run --python 3.14 pytest
-uvx --python 3.14 mypy@latest --strict src/
-uvx ruff check
-```
+`FakeClock` drives the `time_func`/`sleep_func` seam, so a 60-second idle
+window costs no real time. The seam covers the sleeps the kit *initiates* —
+pacing, backoff, the liveness window, the sweep quiet window. It deliberately
+does not cover `expect`/`confirm`/`Exchange.next` timeouts: those are deadlines
+on external events, and a clock whose `sleep` returns immediately would win
+every race against a real future and fire every timeout instantly.
 
 ## License
 

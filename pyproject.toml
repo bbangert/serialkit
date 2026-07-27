@@ -3,7 +3,7 @@
 # name policy); the import package stays `serialkit` (see tool.uv.build-backend).
 name = "serial-toolkit"
 version = "0.0.0"
-description = "Asyncio robustness toolkit for RS232 device drivers: framing, request/response correlation, pacing, reconnect, and a liveness watchdog behind a callback API"
+description = "Wire mechanics for RS232 device drivers: framing, pacing, exclusivity, sequence anchoring, dispatch, reconnect, and liveness behind a callback API"
 readme = "README.md"
 license = "MIT"
 authors = [
@@ -46,6 +46,38 @@ dev = [
     "pytest-asyncio>=1.0",
     "pytest-timeout>=2.4.0",
 ]
+
+[tool.ruff]
+line-length = 88
+
+[tool.ruff.lint]
+# Pinned explicitly: bare `ruff check` follows whatever the latest release
+# enables by default, so the lint contract would otherwise drift with every
+# ruff upgrade.
+select = [
+    "E",
+    "F",
+    "W",
+    "I",
+    "UP",
+    "B",
+    "ASYNC",
+    "SIM",
+    "RUF",
+    # The kit is deliberately defensive at its boundaries, which makes it
+    # exactly the codebase where a broad catch has to justify itself in
+    # writing rather than accumulate by habit.
+    "BLE",
+    "S110",
+    "S112",
+    "FBT",
+    "ARG",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Predicates, callbacks and fixtures in tests take arguments they deliberately
+# ignore, and @parametrize drives boolean positional parameters.
+"tests/*" = ["ARG", "FBT"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
